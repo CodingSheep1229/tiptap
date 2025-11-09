@@ -23,6 +23,15 @@ build/
 # Database files
 *.sqlite
 *.db
+plaid_lab.sqlite
+
+# Node.js / Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
 
 # IDE
 .vscode/
