@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>TipTap - Restaurant Tip Overcharge Detector</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Plaid Link SDK -->
+  <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; padding: 24px; max-width: 1200px; margin: 0 auto; }
+    button { padding: 10px 16px; border: none; border-radius: 8px; cursor: pointer; font-size: 15px; }
+    input[type="number"] { padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; width: 100px; }
+    .primary { background: #111827; color: #fff; margin-right: 8px; }
+    .secondary { background: #e5e7eb; color: #111827; }
+    .small { padding: 6px 12px; font-size: 13px; }
+    .success { background: #10b981; color: white; }
+    .danger { background: #ef4444; color: white; }
+    #log { margin-top: 20px; padding: 12px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; white-space: pre-wrap; max-height: 200px; overflow-y: auto; }
+    .ok { color: #065f46; }
+    .err { color: #7f1d1d; }
+    .muted { color: #6b7280; font-size: 14px; }
+    .section { margin-top: 32px; }
+    .card { background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 16px; margin-bottom: 12px; }
+    .card-header { font-weight: 600; margin-bottom: 8px; font-size: 16px; }
+    .card-body { color: #4b5563; font-size: 14px; }
+    .flex { display: flex; justify-content: space-between; align-items: center; }
+    .badge { padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 500; }
+    .badge-warning { background: #fef3c7; color: #92400e; }
+    .badge-success { background: #d1fae5; color: #065f46; }
+    .badge-pending { background: #dbeafe; color: #1e40af; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #e5e7eb; }
+    th { font-weight: 600; color: #374151; font-size: 13px; }
+    td { font-size: 14px; color: #6b7280; }
+  </style>
+</head>
+<body>
+  <h1>TipTap - Restaurant Tip Tracker</h1>
+  <p class="muted">Track restaurant charges and detect tip overcharges automatically.</p>
+
+  <div>
+    <button id="btn-link" class="primary">Connect a bank</button>
+    <button id="btn-sync" class="secondary">Manual Sync</button>
+    <button id="btn-refresh" class="secondary">Refresh Data</button>
+  </div>
+
+  <div style="margin-top: 16px; padding: 12px; background: #fef3c7; border: 1px solid #fbbf24; border-radius: 8px;">
+    <strong>Sandbox Testing</strong>
+    <p class="muted" style="margin: 8px 0;">Use these buttons to test tip overcharge detection with dynamic test data</p>
+    <button id="btn-test-item" class="secondary small">Create Test Item (50 pending txns)</button>
+    <button id="btn-simulate" class="secondary small">Simulate Transaction Update</button>
+  </div>
+
+  <div id="log"></div>
+
+  <div class="section">
+    <h2>Pending Transactions</h2>
+    <p class="muted">Record your tip amount for pending restaurant charges</p>
+    <div id="pending-transactions"></div>
+  </div>
+
+  <div class="section">
+    <h2>Tip Records</h2>
+    <p class="muted">Track your tip records and see if any restaurants overcharged you</p>
+    <div id="tip-records"></div>
+  </div>
+
+  <script>
+    const BACKEND_URL = "http://localhost:8000"; // 👈 change if needed
+    const logEl = document.getElementById("log");
+    const addLog = (msg, cls="") => {
+      const p = document.createElement("div");
+      if (cls) p.className = cls;
+      p.textContent = msg;
+      logEl.appendChild(p);
+    };
+
+    async function createLinkToken() {
+      addLog("Requesting link_token…");
+      const res = await fetch(`${BACKEND_URL}/link/token`, { method: "POST" });
+      if (!res.ok) throw new Error("Failed to create link_token");
+      const data = await res.json();
+      addLog("Got link_token ✓", "ok");
+      return data.link_token;
+    }
+
+    async function exchangePublicToken(public_token) {
+      addLog("Exchanging public_token for access_token…");
+      const res = await fetch(`${BACKEND_URL}/exchange`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ public_token })
+      });
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(`Exchange failed: ${t}`);
+      }
+      const data = await res.json();
+      addLog(`Exchange OK → item_id=${data.item_id}`, "ok");
+      return data;
+    }
+
+    async function manualSync() {
+      addLog("Triggering /sync…");
+      const res = await fetch(`${BACKEND_URL}/sync`, { method: "POST" });
+      if (!res.ok) {
+        const t = await res.text();
+        addLog(`Sync failed: ${t}`, "err");
+        return;
+      }
+      addLog("Sync requested ✓  (check API logs for results)", "ok");
+      await loadData();
+    }
+
+    async function loadPendingTransactions() {
+      // Get pending transactions
+      const txnsRes = await fetch(`${BACKEND_URL}/transactions/pending`);
+      if (!txnsRes.ok) return;
+      const txns = await txnsRes.json();
+
+      // Get tip records to filter out transactions we've already recorded tips for
+      const tipsRes = await fetch(`${BACKEND_URL}/tips`);
+      const tips = tipsRes.ok ? await tipsRes.json() : [];
+      const recordedPendingIds = new Set(tips.map(t => t.pending_txn_id));
+
+      // Filter out transactions that already have tips recorded
+      const unrecordedTxns = txns.filter(txn => !recordedPendingIds.has(txn.plaid_txn_id));
+
+      const container = document.getElementById("pending-transactions");
+      if (unrecordedTxns.length === 0) {
+        container.innerHTML = '<p class="muted">No pending transactions without tips recorded. Sync your account to see new charges.</p>';
+        return;
+      }
+
+      container.innerHTML = unrecordedTxns.map(txn => `
+        <div class="card">
+          <div class="flex">
+            <div>
+              <div class="card-header">${txn.merchant_name || "Unknown Merchant"}</div>
+              <div class="card-body">
+                Pending charge: $${Math.abs(txn.amount).toFixed(2)} on ${txn.authorized_date || txn.date}
+              </div>
+            </div>
+            <div style="display: flex; gap: 8px; align-items: center;">
+              <input type="number" step="0.01" min="0" placeholder="Tip amount" id="tip-${txn.plaid_txn_id}" />
+              <button class="small success" onclick="recordTip('${txn.plaid_txn_id}')">Record Tip</button>
+            </div>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    async function recordTip(txnId) {
+      const input = document.getElementById(`tip-${txnId}`);
+      const tipAmount = parseFloat(input.value);
+
+      if (isNaN(tipAmount) || tipAmount < 0) {
+        addLog("Please enter a valid tip amount", "err");
+        return;
+      }
+
+      const res = await fetch(`${BACKEND_URL}/tips`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          pending_txn_id: txnId,
+          tip_amount: tipAmount
+        })
+      });
+
+      if (!res.ok) {
+        const t = await res.text();
+        addLog(`Failed to record tip: ${t}`, "err");
+        return;
+      }
+
+      const data = await res.json();
+      addLog(`Tip recorded! Expected total: $${data.expected_total.toFixed(2)}`, "ok");
+      await loadData();
+    }
+
+    async function loadTipRecords() {
+      const res = await fetch(`${BACKEND_URL}/tips`);
+      if (!res.ok) return;
+      const records = await res.json();
+
+      const container = document.getElementById("tip-records");
+      if (records.length === 0) {
+        container.innerHTML = '<p class="muted">No tip records yet. Record a tip for a pending transaction to get started.</p>';
+        return;
+      }
+
+      container.innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>Merchant</th>
+              <th>Base Amount</th>
+              <th>Expected Tip</th>
+              <th>Expected Total</th>
+              <th>Actual Total</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${records.map(r => {
+              let statusBadge;
+              if (r.checked_at) {
+                statusBadge = r.is_overcharged
+                  ? `<span class="badge badge-warning">OVERCHARGED $${r.overcharge_amount.toFixed(2)}</span>`
+                  : `<span class="badge badge-success">VERIFIED</span>`;
+              } else {
+                statusBadge = '<span class="badge badge-pending">PENDING</span>';
+              }
+
+              return `
+                <tr>
+                  <td>${r.merchant_name || "Unknown"}</td>
+                  <td>$${Math.abs(r.pending_amount).toFixed(2)}</td>
+                  <td>$${r.expected_tip_amount.toFixed(2)}</td>
+                  <td>$${r.expected_total.toFixed(2)}</td>
+                  <td>${r.actual_total ? '$' + r.actual_total.toFixed(2) : '—'}</td>
+                  <td>${statusBadge}</td>
+                </tr>
+              `;
+            }).join('')}
+          </tbody>
+        </table>
+      `;
+    }
+
+    async function loadData() {
+      await loadPendingTransactions();
+      await loadTipRecords();
+    }
+
+    // Wire up buttons
+    document.getElementById("btn-link").addEventListener("click", async () => {
+      try {
+        const link_token = await createLinkToken();
+
+        const handler = Plaid.create({
+          token: link_token,
+          onSuccess: async (public_token, metadata) => {
+            addLog("Link success. public_token received ✓", "ok");
+            addLog(`Institution: ${metadata.institution?.name || "n/a"}`);
+            try {
+              await exchangePublicToken(public_token);
+              await manualSync();
+            } catch (e) {
+              addLog(e.message, "err");
+            }
+          },
+          onExit: (err, metadata) => {
+            if (err) addLog(`Link exit: ${err.error_code} — ${err.error_message}`, "err");
+            else addLog("Link exited by user.", "muted");
+          },
+        });
+
+        handler.open();
+      } catch (e) {
+        addLog(e.message, "err");
+      }
+    });
+
+    document.getElementById("btn-sync").addEventListener("click", manualSync);
+    document.getElementById("btn-refresh").addEventListener("click", loadData);
+
+    // Sandbox testing buttons
+    document.getElementById("btn-test-item").addEventListener("click", async () => {
+      addLog("Creating test item with dynamic transactions...");
+      try {
+        const res = await fetch(`${BACKEND_URL}/sandbox/create_test_item`, { method: "POST" });
+        if (!res.ok) {
+          const t = await res.text();
+          addLog(`Failed: ${t}`, "err");
+          return;
+        }
+        const data = await res.json();
+        addLog(`✓ ${data.message}`, "ok");
+        await loadData();
+      } catch (e) {
+        addLog(e.message, "err");
+      }
+    });
+
+    document.getElementById("btn-simulate").addEventListener("click", async () => {
+      addLog("Simulating transaction updates (pending → posted, +$1 overcharge)...");
+      try {
+        const res = await fetch(`${BACKEND_URL}/sandbox/simulate_transaction_update`, { method: "POST" });
+        if (!res.ok) {
+          const t = await res.text();
+          addLog(`Failed: ${t}`, "err");
+          return;
+        }
+        const data = await res.json();
+        addLog(`✓ ${data.message}`, "ok");
+        await loadData();
+      } catch (e) {
+        addLog(e.message, "err");
+      }
+    });
+
+    // Load initial data
+    loadData();
+  </script>
+</body>
+</html>
